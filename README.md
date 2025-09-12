@@ -1,7 +1,7 @@
-# Auto-bold target for JPMN/Migaku cards (Anki)
+# Auto-bold target for JPMN cards (Anki)
 
 Automatically bold the target word in the sentence at review time without touching your templates.  
-Works with JPMN and converted Migaku cards. Handles kanji + kana conjugations, kana-only words, and even cards that already wrap targets with `<t>…</t>`.
+Works with JPMN and converted Anki cards. Handles kanji + kana conjugations, kana-only words, and even cards that already wrap targets with `<t>…</t>`.
 
 ## Features
 - Bold on render, no template edits
