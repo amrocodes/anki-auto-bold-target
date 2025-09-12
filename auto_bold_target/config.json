@@ -1,0 +1,19 @@
+{
+  "note_types": ["JP Mining Note"],
+  "headword_fields": ["Word", "Key"],
+  "reading_fields": ["WordReading"],
+  "sentence_selectors": [
+    ".full-sentence",
+    ".jpsentence",
+    ".sentence",
+    ".sentence-block",
+    ".expression--sentence"
+  ],
+  "convert_t_tag": true,
+  "regex_enable": true,
+  "kana_bridge_len": 12,
+  "first_match_only": true,
+  "defer_ms": 60,
+  "observe_ms": 3000,
+  "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }"
+}
