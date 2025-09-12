@@ -1,36 +1,10 @@
-# Auto-bold target (JPMN/Migaku) — v2 with Config
+# Auto-bold target (JPMN/Migaku) — v2.0.4 (no webview hook; timer-based reporting)
 # Put this file in: addons21/auto_bold_target/__init__.py
 
 from aqt import mw, gui_hooks
-from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox, QMenu
+from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
 from aqt.utils import tooltip
 import json
-
-# ---- JS bridge handler (compatible across Anki versions) -------------------
-def _handle_cmd(*args):
-    """
-    Newer Anki: (handled: bool, message: str, context) -> (handled, reply)
-    Older Anki: (message: str, context) -> bool
-    """
-    if len(args) == 3:
-        handled, message, context = args
-        if message == "auto_bold_target__report":
-            _report_result()
-            return (True, None)
-        return (handled, None)
-    elif len(args) >= 1:
-        message = args[0]
-        if message == "auto_bold_target__report":
-            _report_result()
-            return True
-        return False
-
-# register (avoid duplicate registration on reload)
-try:
-    gui_hooks.webview_did_receive_js_message.remove(_handle_cmd)
-except Exception:
-    pass
-gui_hooks.webview_did_receive_js_message.append(_handle_cmd)
 
 # -------- Config helpers ----------------------------------------------------
 DEFAULTS = {
@@ -48,17 +22,15 @@ DEFAULTS = {
     "regex_enable": True,
     "kana_bridge_len": 12,
     "first_match_only": True,
-    "defer_ms": 60,
-    "observe_ms": 3000,
+    "defer_ms": 60,      # JS injection delay (ms)
+    "observe_ms": 3000,  # MutationObserver lifetime (ms)
     "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }",
 }
 
 def _cfg():
-    # Read current config, merge with defaults to be robust to missing keys
     raw = mw.addonManager.getConfig(__name__) or {}
     cfg = dict(DEFAULTS)
-    for k, v in raw.items():
-        cfg[k] = v
+    cfg.update(raw)
     return cfg
 
 # -------- Utility -----------------------------------------------------------
@@ -83,7 +55,6 @@ def _should_run(card, cfg):
 
 # -------- Core JS builder ---------------------------------------------------
 def _js_builder(headword, reading, cfg):
-    # JSON-serialize values to embed safely in JS
     H = json.dumps(headword or "")
     R = json.dumps(reading or "")
     SELECTORS = json.dumps(cfg["sentence_selectors"])
@@ -95,15 +66,13 @@ def _js_builder(headword, reading, cfg):
 
     return r"""
 (function(){
-  // Config-injected values
   var SELECTORS   = %s;
   var CONVERT_T   = %s;
   var REGEX_EN    = %s;
-  var BRIDGE_LEN  = %d;   // e.g., 12
-  var FIRST_MATCH = %s;   // stop after first wrap?
-  var OBS_MS      = %d;   // observer lifetime in ms
+  var BRIDGE_LEN  = %d;
+  var FIRST_MATCH = %s;
+  var OBS_MS      = %d;
 
-  // Find sentence container from selector list; else fall back to the whole card.
   function pickSentenceEl(){
     for (var i=0;i<SELECTORS.length;i++){
       var el = document.querySelector(SELECTORS[i]);
@@ -134,21 +103,17 @@ def _js_builder(headword, reading, cfg):
   function attemptBold(){
     if (!root) return "no-sentence";
 
-    // Step 0: convert <t>…</t> → <b class="auto-bold">…</b>
     var converted = convertTTags(root);
     if (converted > 0) return "applied:t";
 
-    // If we do have an explicit sentence container and it already has bold, we consider it done.
     if (sentenceEl && sentenceEl.querySelector('b')) return "already-bolded";
-
     if (!REGEX_EN) return "no-match";
 
-    var target  = %s;   // Word/Key
-    var reading = %s;   // WordReading
+    var target  = %s;
+    var reading = %s;
 
-    // Helpers / character classes
     var KANA = "[\\u3040-\\u309F\\u30A0-\\u30FFー]";
-    var JAP  = "[\\u3040-\\u30FF\\u4E00-\\u9FFF々ー]"; // kana+kanji+ー
+    var JAP  = "[\\u3040-\\u30FF\\u4E00-\\u9FFF々ー]";
     function esc(s){ return (s||"").replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&"); }
     function onlyKana(s){ return (s||"").replace(/[^ぁ-ゖァ-ヺー]/g,""); }
     function toHira(s){ return (s||"").replace(/[\\u30A1-\\u30FA]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60)); }
@@ -156,10 +121,8 @@ def _js_builder(headword, reading, cfg):
     function kanjiCore(s){ return (s||"").replace(/[^\\u4E00-\\u9FFF々]/g,""); }
     var hasKanji = /[\\u4E00-\\u9FFF々]/.test(target || "");
 
-    // Build patterns to try (first hit wins)
     var patterns = [];
 
-    // A) Flexible kanji bridge: each kanji then up to BRIDGE_LEN Japanese chars
     if (target && hasKanji){
       var ks = (target.match(/[\\u4E00-\\u9FFF々]/g) || []);
       if (ks.length){
@@ -168,7 +131,6 @@ def _js_builder(headword, reading, cfg):
       }
     }
 
-    // B) Reading fallback (kana) + trailing kana
     if (reading){
       var rd = onlyKana(reading);
       if (rd){
@@ -177,13 +139,11 @@ def _js_builder(headword, reading, cfg):
       }
     }
 
-    // C) Kana headword + trailing kana
     if (target && !hasKanji && /[\\u3040-\\u30FF]/.test(target)){
       patterns.push(new RegExp(esc(toHira(target)) + KANA + "*", "g"));
       patterns.push(new RegExp(esc(toKata(target)) + KANA + "*", "g"));
     }
 
-    // D) Literal kanji core, then E) literal target
     if (target){
       var kc = kanjiCore(target);
       if (kc) patterns.push(new RegExp(esc(kc), "g"));
@@ -194,7 +154,7 @@ def _js_builder(headword, reading, cfg):
 
     function forEachTextNode(node, cb){
       if (node.nodeType === 1) {
-        if (node.tagName && node.tagName.toLowerCase() === "rt") return; // skip furigana
+        if (node.tagName && node.tagName.toLowerCase() === "rt") return;
         for (var i=0; i<node.childNodes.length; i++) forEachTextNode(node.childNodes[i], cb);
       } else if (node.nodeType === 3) {
         cb(node);
@@ -252,7 +212,10 @@ def _inject_css_once(cfg):
     if not css:
         return
     js = "var s=document.getElementById('autoBoldCSS'); if(!s){s=document.createElement('style'); s.id='autoBoldCSS'; s.textContent=%s; document.documentElement.appendChild(s);}" % json.dumps(css)
-    mw.reviewer.web.eval(js)
+    try:
+        mw.reviewer.web.eval(js)
+    except Exception:
+        pass
 
 # -------- Runner & reporter -------------------------------------------------
 def _run(card, report=False):
@@ -264,18 +227,15 @@ def _run(card, report=False):
     reading = _get_first(note, cfg["reading_fields"])
     js = _js_builder(head, reading, cfg)
     delay = int(cfg.get("defer_ms", 60))
-    # Inject JS, then (optionally) report a bit later
-    mw.reviewer.web.eval(f"(function(){{setTimeout(function(){{{js}}}, {delay});}})();")
+    try:
+        mw.reviewer.web.eval(f"(function(){{setTimeout(function(){{{js}}}, {delay});}})();")
+    except Exception:
+        return
     if report:
-        # give the injected JS time to apply before checking
-        mw.reviewer.web.eval(
-            f"(function(){{setTimeout(function(){{"
-            f"pycmd('auto_bold_target__report');"
-            f"}}, {delay + 150});}})();"
-        )
+        # Let the injected JS settle, then run the DOM check via Python callback.
+        mw.progress.timer(delay + 200, _report_result, False)
 
 def _report_result():
-    # Summarize what happened on the visible side
     check_js = """
       (function(){
         function pickSentenceEl(){
@@ -296,7 +256,10 @@ def _report_result():
         return 'no-match (t='+tCount+', b='+boldCount+')';
       })();
     """ % json.dumps(_cfg()["sentence_selectors"])
-    mw.reviewer.web.evalWithCallback(check_js, lambda res: tooltip(f"Auto-bold: {res}", period=2500))
+    try:
+        mw.reviewer.web.evalWithCallback(check_js, lambda res: tooltip(f"Auto-bold: {res}", period=2500))
+    except Exception:
+        pass
 
 # -------- Hooks -------------------------------------------------------------
 def on_q(card):
@@ -306,7 +269,6 @@ def on_q(card):
 def on_a(card):
     _run(card)
 
-# avoid double-adding hooks on reload:
 try:
     gui_hooks.reviewer_did_show_question.remove(on_q)
 except Exception:
@@ -318,9 +280,9 @@ except Exception:
 gui_hooks.reviewer_did_show_question.append(on_q)
 gui_hooks.reviewer_did_show_answer.append(on_a)
 
-# -------- Menu actions ------------------------------------------------------
+# -------- Tools menu actions (stable) --------------------------------------
 def action_run_now():
-    c = mw.reviewer.card
+    c = getattr(mw.reviewer, "card", None)
     if c:
         _inject_css_once(_cfg())
         _run(c, report=True)
@@ -332,38 +294,30 @@ def action_config():
         return fn(__name__)
     except Exception:
         pass
-
     # Try older API name
     try:
         fn = getattr(mw.addonManager, "showConfigDialog")
         return fn(__name__)
     except Exception:
         pass
-
-    # Fallback: minimal JSON editor (works everywhere)
+    # Fallback JSON editor (Qt5/Qt6)
     current = mw.addonManager.getConfig(__name__) or {}
     try:
         initial = json.dumps(current if current else DEFAULTS, ensure_ascii=False, indent=2)
     except Exception:
         initial = "{}"
-
     dlg = QDialog(mw)
     dlg.setWindowTitle("Auto-bold: Configure (fallback)")
     layout = QVBoxLayout(dlg)
-
     edit = QTextEdit(dlg)
     edit.setPlainText(initial)
     layout.addWidget(edit)
-
-    # PyQt6/Qt6 uses StandardButton; PyQt5 uses top-level attrs.
     try:
-        Std = QDialogButtonBox.StandardButton
+        Std = QDialogButtonBox.StandardButton  # PyQt6
         buttons = QDialogButtonBox(Std.Save | Std.Cancel, parent=dlg)
     except AttributeError:
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dlg)
-
     layout.addWidget(buttons)
-
     def on_save():
         try:
             data = json.loads(edit.toPlainText())
@@ -374,72 +328,21 @@ def action_config():
             dlg.accept()
         except Exception as e:
             tooltip(f"Save failed: {e}", period=2500)
-
     buttons.accepted.connect(on_save)
     buttons.rejected.connect(dlg.reject)
     dlg.exec()
 
-
-# helper to avoid duplicate menu entries on reload
-# -------- Top-level "Auto-bold" menu ---------------------------------------
-_menu_ref = None
-
-def _get_or_create_menu() -> QMenu:
-    """Create/return a top-level 'Auto-bold' menu. Fallback to Tools if needed."""
-    global _menu_ref
-    if _menu_ref and not _menu_ref.isHidden():
-        return _menu_ref
-
-    bar = getattr(mw.form, "menubar", None)
-    if not bar:
-        # some builds expose QMainWindow.menuBar()
-        try:
-            bar = mw.menuBar()
-        except Exception:
-            bar = None
-
-    if not bar:
-        # last resort: Tools menu (shouldn’t happen on desktop)
-        return mw.form.menuTools
-
-    # Reuse if already created (e.g., on live reload)
-    for m in bar.findChildren(QMenu):
-        if m.objectName() == "menuAutoBold":
-            _menu_ref = m
-            return m
-
-    _menu_ref = bar.addMenu("Auto-bold")
-    _menu_ref.setObjectName("menuAutoBold")
-    return _menu_ref
-
-def _add_menu_action_to(menu: QMenu, action: QAction):
-    """Avoid duplicate actions by stable objectName."""
+def _add_menu_action(action: QAction):
     action.setObjectName("AutoBold|" + action.text())
-    for a in menu.actions():
+    for a in mw.form.menuTools.actions():
         if a.objectName() == action.objectName():
             return
-    menu.addAction(action)
+    mw.form.menuTools.addAction(action)
 
-def _remove_from_tools(texts):
-    """Clean up any old entries from Tools menu if they exist."""
-    tools = getattr(mw.form, "menuTools", None)
-    if not tools:
-        return
-    for a in list(tools.actions()):
-        if a.text() in texts:
-            tools.removeAction(a)
+act1 = QAction("Auto-bold now (report)", mw)
+act1.triggered.connect(action_run_now)
+_add_menu_action(act1)
 
-# Build actions
-act_run = QAction("Auto-bold now (report)", mw)
-act_run.triggered.connect(action_run_now)
-
-act_cfg = QAction("Configure Auto-bold…", mw)
-act_cfg.triggered.connect(action_config)
-
-# Remove old Tools entries (if you had them previously)
-_remove_from_tools(["Auto-bold now (report)", "Configure Auto-bold…"])
-
-# Add to the top-level "Auto-bold" menu
-auto_menu = _get_or_create_menu()
-_add_menu_action_to(auto_menu, act_run)
-_add_menu_action_to(auto_menu, act_cfg)
+act2 = QAction("Configure Auto-bold…", mw)
+act2.triggered.connect(action_config)
+_add_menu_action(act2)
