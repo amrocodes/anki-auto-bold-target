@@ -1,0 +1,22 @@
+name: build-and-release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .ankiaddon
+        run: |
+          cd auto_bold_target
+          zip -r ../auto_bold_target.ankiaddon .
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: auto_bold_target.ankiaddon
