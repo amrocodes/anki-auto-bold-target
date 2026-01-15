@@ -1,5 +1,4 @@
-# Auto-bold target (JPMN/Migaku) — v2.0.4 (no webview hook; timer-based reporting)
-# Put this file in: addons21/auto_bold_target/__init__.py
+# Auto-bold target (JPMN/Migaku) — v2.1.0 (strict scope, safe CSS, single hooks)
 
 from aqt import mw, gui_hooks
 from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
@@ -11,6 +10,8 @@ DEFAULTS = {
     "note_types": ["JP Mining Note"],
     "headword_fields": ["Word", "Key"],
     "reading_fields": ["WordReading"],
+
+    # sentence containers to search (first matching & scoring one wins)
     "sentence_selectors": [
         ".full-sentence",
         ".jpsentence",
@@ -18,12 +19,22 @@ DEFAULTS = {
         ".sentence-block",
         ".expression--sentence",
     ],
+
+    # behaviour
+    "strict_scope": True,         # only operate inside a sentence element
+    "fallback_to_root": False,    # if no sentence is found, do nothing
+
+    # matching
     "convert_t_tag": True,
     "regex_enable": True,
     "kana_bridge_len": 12,
     "first_match_only": True,
-    "defer_ms": 60,      # JS injection delay (ms)
-    "observe_ms": 3000,  # MutationObserver lifetime (ms)
+
+    # timing
+    "defer_ms": 60,               # JS injection delay (ms)
+    "observe_ms": 3000,           # MutationObserver lifetime (ms)
+
+    # style (you can override in Tools → Configure)
     "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }",
 }
 
@@ -63,26 +74,74 @@ def _js_builder(headword, reading, cfg):
     BRIDGE    = int(cfg["kana_bridge_len"])
     FIRST_ONE = "true" if cfg["first_match_only"] else "false"
     OBS_MS    = int(cfg["observe_ms"])
+    STRICT    = "true" if cfg.get("strict_scope", True) else "false"
+    FALLBACK  = "true" if cfg.get("fallback_to_root", False) else "false"
 
+    # NOTE: we pass target/reading early for sentence picking
     return r"""
 (function(){
+  // --- config injected ---
+  var target  = %s;
+  var reading = %s;
+
   var SELECTORS   = %s;
+  var STRICT      = %s;
+  var FALLBACK    = %s;
+
   var CONVERT_T   = %s;
   var REGEX_EN    = %s;
   var BRIDGE_LEN  = %d;
   var FIRST_MATCH = %s;
   var OBS_MS      = %d;
 
-  function pickSentenceEl(){
-    for (var i=0;i<SELECTORS.length;i++){
-      var el = document.querySelector(SELECTORS[i]);
-      if (el) return el;
+  // --- helpers for sentence pick & matching ---
+  var KANA = "[\u3040-\u309F\u30A0-\u30FFー]";
+  var JAP  = "[\u3040-\u30FF\u4E00-\u9FFF々ー]";
+  function esc(s){ return (s||"").replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
+  function onlyKana(s){ return (s||"").replace(/[^ぁ-ゖァ-ヺー]/g,""); }
+  function toHira(s){ return (s||"").replace(/[\u30A1-\u30FA]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60)); }
+  function toKata(s){ return (s||"").replace(/[\u3041-\u3096]/g, c=>String.fromCharCode(c.charCodeAt(0)+0x60)); }
+  function kanjiCore(s){ return (s||"").replace(/[^\u4E00-\u9FFF々]/g,""); }
+  function jaLen(s){ var m=(s||"").match(/[\u3040-\u30FF\u4E00-\u9FFF々ー]/g); return m?m.length:0; }
+
+  function looksLikeSentence(el){
+    if (!el) return false;
+    var t = el.textContent || "";
+    if (!t) return false;
+    // Prefer containers that contain the headword or reading (normalized)
+    var ok = false;
+    if (target && t.indexOf(target) >= 0) ok = true;
+    var rd = onlyKana(reading);
+    if (!ok && rd){
+      if (t.indexOf(toHira(rd)) >= 0 || t.indexOf(toKata(rd)) >= 0) ok = true;
     }
-    return null;
+    // Fallback: long-ish JP text = likely a sentence
+    if (!ok && jaLen(t) >= 8) ok = true;
+    return ok;
   }
+
+  function pickSentenceEl(){
+    var best = null, bestScore = -1;
+    for (var i=0;i<SELECTORS.length;i++){
+      var list = document.querySelectorAll(SELECTORS[i]);
+      for (var j=0;j<list.length;j++){
+        var el = list[j];
+        if (!looksLikeSentence(el)) continue;
+        var score = jaLen(el.textContent||"");
+        if (score > bestScore){ best = el; bestScore = score; }
+      }
+    }
+    return best;
+  }
+
   var sentenceEl = pickSentenceEl();
+  if (!sentenceEl && STRICT && !FALLBACK){
+    // no obvious sentence container: bail out to avoid bad highlighting
+    return;
+  }
   var root = sentenceEl || document.querySelector('#qa') || document.body;
 
+  // convert <t>…</t> → <b class="auto-bold">…</b> in-scope only
   function convertTTags(scope){
     if (!CONVERT_T) return 0;
     var tEls = scope.querySelectorAll('t');
@@ -109,28 +168,18 @@ def _js_builder(headword, reading, cfg):
     if (sentenceEl && sentenceEl.querySelector('b')) return "already-bolded";
     if (!REGEX_EN) return "no-match";
 
-    var target  = %s;
-    var reading = %s;
-
-    var KANA = "[\\u3040-\\u309F\\u30A0-\\u30FFー]";
-    var JAP  = "[\\u3040-\\u30FF\\u4E00-\\u9FFF々ー]";
-    function esc(s){ return (s||"").replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&"); }
-    function onlyKana(s){ return (s||"").replace(/[^ぁ-ゖァ-ヺー]/g,""); }
-    function toHira(s){ return (s||"").replace(/[\\u30A1-\\u30FA]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60)); }
-    function toKata(s){ return (s||"").replace(/[\\u3041-\\u3096]/g, c=>String.fromCharCode(c.charCodeAt(0)+0x60)); }
-    function kanjiCore(s){ return (s||"").replace(/[^\\u4E00-\\u9FFF々]/g,""); }
-    var hasKanji = /[\\u4E00-\\u9FFF々]/.test(target || "");
-
+    var hasKanji = /[\u4E00-\u9FFF々]/.test(target || "");
     var patterns = [];
 
+    // A) Flexible kanji bridge
     if (target && hasKanji){
-      var ks = (target.match(/[\\u4E00-\\u9FFF々]/g) || []);
+      var ks = (target.match(/[\u4E00-\u9FFF々]/g) || []);
       if (ks.length){
         var core = ks.map(function(k){ return esc(k) + JAP + "{0,"+BRIDGE_LEN+"}"; }).join("");
         patterns.push(new RegExp(core, "g"));
       }
     }
-
+    // B) Reading fallback (kana) + trailing kana
     if (reading){
       var rd = onlyKana(reading);
       if (rd){
@@ -138,12 +187,12 @@ def _js_builder(headword, reading, cfg):
         patterns.push(new RegExp(esc(toKata(rd)) + KANA + "*", "g"));
       }
     }
-
-    if (target && !hasKanji && /[\\u3040-\\u30FF]/.test(target)){
+    // C) Kana headword + trailing kana
+    if (target && !hasKanji && /[\u3040-\u30FF]/.test(target)){
       patterns.push(new RegExp(esc(toHira(target)) + KANA + "*", "g"));
       patterns.push(new RegExp(esc(toKata(target)) + KANA + "*", "g"));
     }
-
+    // D/E) Literal kanji core, then literal target
     if (target){
       var kc = kanjiCore(target);
       if (kc) patterns.push(new RegExp(esc(kc), "g"));
@@ -154,7 +203,7 @@ def _js_builder(headword, reading, cfg):
 
     function forEachTextNode(node, cb){
       if (node.nodeType === 1) {
-        if (node.tagName && node.tagName.toLowerCase() === "rt") return;
+        if (node.tagName && node.tagName.toLowerCase() === "rt") return; // skip furigana
         for (var i=0; i<node.childNodes.length; i++) forEachTextNode(node.childNodes[i], cb);
       } else if (node.nodeType === 3) {
         cb(node);
@@ -204,14 +253,26 @@ def _js_builder(headword, reading, cfg):
     setTimeout(function(){ try{ obs.disconnect(); }catch(e){} }, OBS_MS);
   }
 })();
-""" % (SELECTORS, CONVERT_T, REGEX_EN, BRIDGE, FIRST_ONE, OBS_MS, H, R)
+""" % (H, R, SELECTORS, STRICT, FALLBACK, CONVERT_T, REGEX_EN, BRIDGE, FIRST_ONE, OBS_MS)
 
-# -------- CSS injection -----------------------------------------------------
+# -------- CSS injection (append last) --------------------------------------
 def _inject_css_once(cfg):
     css = (cfg.get("extra_css") or "").strip()
     if not css:
         return
-    js = "var s=document.getElementById('autoBoldCSS'); if(!s){s=document.createElement('style'); s.id='autoBoldCSS'; s.textContent=%s; document.documentElement.appendChild(s);}" % json.dumps(css)
+    js = r"""
+    (function(){
+      try{
+        // remove previous so we can re-append as last style (wins cascade)
+        var old = document.getElementById('autoBoldCSS');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
+        var el = document.createElement('style');
+        el.id = 'autoBoldCSS';
+        el.textContent = %s;
+        (document.head || document.documentElement).appendChild(el);
+      }catch(e){}
+    })();
+    """ % json.dumps(css)
     try:
         mw.reviewer.web.eval(js)
     except Exception:
@@ -232,28 +293,20 @@ def _run(card, report=False):
     except Exception:
         return
     if report:
-        # Let the injected JS settle, then run the DOM check via Python callback.
         mw.progress.timer(delay + 200, _report_result, False)
 
 def _report_result():
+    # Keep the report simple; just check if any auto-bold was applied in common sentence containers
     check_js = """
       (function(){
-        function pickSentenceEl(){
-          var sels = %s;
-          for (var i=0;i<sels.length;i++){
-            var el = document.querySelector(sels[i]);
-            if (el) return el;
-          }
-          return null;
+        var sels = %s;
+        var count = 0;
+        for (var i=0;i<sels.length;i++){
+          var x = document.querySelectorAll(sels[i] + " b.auto-bold");
+          count += x.length;
         }
-        var sentenceEl = pickSentenceEl();
-        var root = sentenceEl || document.querySelector('#qa') || document.body;
-        if (!root) return 'no-sentence';
-        var tCount = root.querySelectorAll('t').length;
-        var boldCount = root.querySelectorAll('b.auto-bold').length;
-        if (boldCount) return 'applied (t='+tCount+', b='+boldCount+')';
-        if (sentenceEl && sentenceEl.querySelector('b')) return 'already-bolded';
-        return 'no-match (t='+tCount+', b='+boldCount+')';
+        if (count) return "applied ("+count+")";
+        return "no-match";
       })();
     """ % json.dumps(_cfg()["sentence_selectors"])
     try:
@@ -261,26 +314,39 @@ def _report_result():
     except Exception:
         pass
 
+# -------- JP font/locale helper (optional, keeps JP glyphs) ----------------
+def _force_lang_ja():
+    try:
+        mw.reviewer.web.eval(r"""
+            (function(){
+              try {
+                document.documentElement.setAttribute('lang','ja');
+                document.documentElement.classList.add('lang-ja');
+              } catch(e) {}
+            })();
+        """)
+    except Exception:
+        pass
+
 # -------- Hooks -------------------------------------------------------------
-def on_q(card):
+def _on_q(card):
+    _force_lang_ja()
     _inject_css_once(_cfg())
     _run(card)
 
-def on_a(card):
+def _on_a(card):
+    _force_lang_ja()
     _run(card)
 
-try:
-    gui_hooks.reviewer_did_show_question.remove(on_q)
-except Exception:
-    pass
-try:
-    gui_hooks.reviewer_did_show_answer.remove(on_a)
-except Exception:
-    pass
-gui_hooks.reviewer_did_show_question.append(on_q)
-gui_hooks.reviewer_did_show_answer.append(on_a)
+# ensure we don't double-register
+try: gui_hooks.reviewer_did_show_question.remove(_on_q)
+except Exception: pass
+try: gui_hooks.reviewer_did_show_answer.remove(_on_a)
+except Exception: pass
+gui_hooks.reviewer_did_show_question.append(_on_q)
+gui_hooks.reviewer_did_show_answer.append(_on_a)
 
-# -------- Tools menu actions (stable) --------------------------------------
+# -------- Tools menu actions -----------------------------------------------
 def action_run_now():
     c = getattr(mw.reviewer, "card", None)
     if c:
@@ -288,13 +354,13 @@ def action_run_now():
         _run(c, report=True)
 
 def action_config():
-    # Try modern Anki API
+    # Try modern Anki API if available
     try:
         fn = getattr(mw.addonManager, "editConfig")
         return fn(__name__)
     except Exception:
         pass
-    # Try older API name
+    # Older API name
     try:
         fn = getattr(mw.addonManager, "showConfigDialog")
         return fn(__name__)
@@ -306,12 +372,9 @@ def action_config():
         initial = json.dumps(current if current else DEFAULTS, ensure_ascii=False, indent=2)
     except Exception:
         initial = "{}"
-    dlg = QDialog(mw)
-    dlg.setWindowTitle("Auto-bold: Configure (fallback)")
+    dlg = QDialog(mw); dlg.setWindowTitle("Auto-bold: Configure (fallback)")
     layout = QVBoxLayout(dlg)
-    edit = QTextEdit(dlg)
-    edit.setPlainText(initial)
-    layout.addWidget(edit)
+    edit = QTextEdit(dlg); edit.setPlainText(initial); layout.addWidget(edit)
     try:
         Std = QDialogButtonBox.StandardButton  # PyQt6
         buttons = QDialogButtonBox(Std.Save | Std.Cancel, parent=dlg)
@@ -339,10 +402,5 @@ def _add_menu_action(action: QAction):
             return
     mw.form.menuTools.addAction(action)
 
-act1 = QAction("Auto-bold now (report)", mw)
-act1.triggered.connect(action_run_now)
-_add_menu_action(act1)
-
-act2 = QAction("Configure Auto-bold…", mw)
-act2.triggered.connect(action_config)
-_add_menu_action(act2)
+act1 = QAction("Auto-bold now (report)", mw); act1.triggered.connect(action_run_now); _add_menu_action(act1)
+act2 = QAction("Configure Auto-bold…", mw);   act2.triggered.connect(action_config); _add_menu_action(act2)
