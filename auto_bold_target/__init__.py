@@ -1,9 +1,9 @@
-# Auto-bold target (JPMN/Migaku) — v2.1.0 (strict scope, safe CSS, single hooks)
+# Auto-bold target (JPMN/Migaku) — v2.2.0 (strict scope + persist to field)
 
 from aqt import mw, gui_hooks
 from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
 from aqt.utils import tooltip
-import json
+import json, base64
 
 # -------- Config helpers ----------------------------------------------------
 DEFAULTS = {
@@ -11,7 +11,6 @@ DEFAULTS = {
     "headword_fields": ["Word", "Key"],
     "reading_fields": ["WordReading"],
 
-    # sentence containers to search (first matching & scoring one wins)
     "sentence_selectors": [
         ".full-sentence",
         ".jpsentence",
@@ -21,8 +20,8 @@ DEFAULTS = {
     ],
 
     # behaviour
-    "strict_scope": True,         # only operate inside a sentence element
-    "fallback_to_root": False,    # if no sentence is found, do nothing
+    "strict_scope": True,
+    "fallback_to_root": False,
 
     # matching
     "convert_t_tag": True,
@@ -31,10 +30,15 @@ DEFAULTS = {
     "first_match_only": True,
 
     # timing
-    "defer_ms": 60,               # JS injection delay (ms)
-    "observe_ms": 3000,           # MutationObserver lifetime (ms)
+    "defer_ms": 60,
+    "observe_ms": 3000,
 
-    # style (you can override in Tools → Configure)
+    # persistence
+    "persist_to_field": True,          # write back into a field so AnkiDroid sees it
+    "persist_field_name": "sentence",  # your field is named "sentence"
+    "persist_once": True,              # skip if field already contains <b class="auto-bold">
+
+    # style
     "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }",
 }
 
@@ -64,6 +68,46 @@ def _should_run(card, cfg):
     except Exception:
         return True
 
+# -------- WebView bridge (persist callback) --------------------------------
+def _handle_cmd(msg, _context=None):
+    # Message format: auto_bold_target__persist:<base64 innerHTML>
+    if not isinstance(msg, str) or not msg.startswith("auto_bold_target__persist:"):
+        return False
+    try:
+        b64 = msg.split(":", 1)[1]
+        html = base64.b64decode(b64).decode("utf-8", "replace")
+    except Exception:
+        return True
+
+    cfg = _cfg()
+    if not cfg.get("persist_to_field", True):
+        return True
+
+    card = getattr(mw.reviewer, "card", None)
+    if not card:
+        return True
+
+    field_name = cfg.get("persist_field_name", "sentence")
+    try:
+        note = card.note()
+        if field_name not in note:
+            tooltip(f"Auto-bold: field '{field_name}' not found", period=2000)
+            return True
+
+        # Optional: avoid repeated writes if already persisted
+        if cfg.get("persist_once", True) and "auto-bold" in note[field_name]:
+            return True
+
+        note[field_name] = html
+        note.flush()
+        # no need to checkpoint here; lightweight write during review
+        tooltip("Auto-bold: saved to note", period=1200)
+    except Exception as e:
+        tooltip(f"Auto-bold: save failed ({e})", period=3000)
+    return True
+
+gui_hooks.webview_did_receive_js_message.append(_handle_cmd)
+
 # -------- Core JS builder ---------------------------------------------------
 def _js_builder(headword, reading, cfg):
     H = json.dumps(headword or "")
@@ -76,8 +120,8 @@ def _js_builder(headword, reading, cfg):
     OBS_MS    = int(cfg["observe_ms"])
     STRICT    = "true" if cfg.get("strict_scope", True) else "false"
     FALLBACK  = "true" if cfg.get("fallback_to_root", False) else "false"
+    PERSIST   = "true" if cfg.get("persist_to_field", True) else "false"
 
-    # NOTE: we pass target/reading early for sentence picking
     return r"""
 (function(){
   // --- config injected ---
@@ -93,8 +137,9 @@ def _js_builder(headword, reading, cfg):
   var BRIDGE_LEN  = %d;
   var FIRST_MATCH = %s;
   var OBS_MS      = %d;
+  var PERSIST     = %s;
 
-  // --- helpers for sentence pick & matching ---
+  // --- helpers ---
   var KANA = "[\u3040-\u309F\u30A0-\u30FFー]";
   var JAP  = "[\u3040-\u30FF\u4E00-\u9FFF々ー]";
   function esc(s){ return (s||"").replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
@@ -108,14 +153,12 @@ def _js_builder(headword, reading, cfg):
     if (!el) return false;
     var t = el.textContent || "";
     if (!t) return false;
-    // Prefer containers that contain the headword or reading (normalized)
     var ok = false;
     if (target && t.indexOf(target) >= 0) ok = true;
     var rd = onlyKana(reading);
     if (!ok && rd){
       if (t.indexOf(toHira(rd)) >= 0 || t.indexOf(toKata(rd)) >= 0) ok = true;
     }
-    // Fallback: long-ish JP text = likely a sentence
     if (!ok && jaLen(t) >= 8) ok = true;
     return ok;
   }
@@ -136,12 +179,10 @@ def _js_builder(headword, reading, cfg):
 
   var sentenceEl = pickSentenceEl();
   if (!sentenceEl && STRICT && !FALLBACK){
-    // no obvious sentence container: bail out to avoid bad highlighting
-    return;
+    return; // avoid whole-card effects
   }
   var root = sentenceEl || document.querySelector('#qa') || document.body;
 
-  // convert <t>…</t> → <b class="auto-bold">…</b> in-scope only
   function convertTTags(scope){
     if (!CONVERT_T) return 0;
     var tEls = scope.querySelectorAll('t');
@@ -159,6 +200,28 @@ def _js_builder(headword, reading, cfg):
     return converted;
   }
 
+  function forEachTextNode(node, cb){
+    if (node.nodeType === 1) {
+      if (node.tagName && node.tagName.toLowerCase() === "rt") return; // skip furigana
+      for (var i=0; i<node.childNodes.length; i++) forEachTextNode(node.childNodes[i], cb);
+    } else if (node.nodeType === 3) {
+      cb(node);
+    }
+  }
+
+  function wrapInNode(textNode, start, end){
+    var text = textNode.nodeValue;
+    var before = document.createTextNode(text.slice(0, start));
+    var mid    = document.createElement("b");
+    mid.className = "auto-bold";
+    mid.textContent = text.slice(start, end);
+    var after  = document.createTextNode(text.slice(end));
+    var parent = textNode.parentNode;
+    parent.replaceChild(after, textNode);
+    parent.insertBefore(mid, after);
+    parent.insertBefore(before, mid);
+  }
+
   function attemptBold(){
     if (!root) return "no-sentence";
 
@@ -171,7 +234,6 @@ def _js_builder(headword, reading, cfg):
     var hasKanji = /[\u4E00-\u9FFF々]/.test(target || "");
     var patterns = [];
 
-    // A) Flexible kanji bridge
     if (target && hasKanji){
       var ks = (target.match(/[\u4E00-\u9FFF々]/g) || []);
       if (ks.length){
@@ -179,7 +241,6 @@ def _js_builder(headword, reading, cfg):
         patterns.push(new RegExp(core, "g"));
       }
     }
-    // B) Reading fallback (kana) + trailing kana
     if (reading){
       var rd = onlyKana(reading);
       if (rd){
@@ -187,12 +248,10 @@ def _js_builder(headword, reading, cfg):
         patterns.push(new RegExp(esc(toKata(rd)) + KANA + "*", "g"));
       }
     }
-    // C) Kana headword + trailing kana
     if (target && !hasKanji && /[\u3040-\u30FF]/.test(target)){
       patterns.push(new RegExp(esc(toHira(target)) + KANA + "*", "g"));
       patterns.push(new RegExp(esc(toKata(target)) + KANA + "*", "g"));
     }
-    // D/E) Literal kanji core, then literal target
     if (target){
       var kc = kanjiCore(target);
       if (kc) patterns.push(new RegExp(esc(kc), "g"));
@@ -200,28 +259,6 @@ def _js_builder(headword, reading, cfg):
     }
 
     if (!patterns.length) return "no-match";
-
-    function forEachTextNode(node, cb){
-      if (node.nodeType === 1) {
-        if (node.tagName && node.tagName.toLowerCase() === "rt") return; // skip furigana
-        for (var i=0; i<node.childNodes.length; i++) forEachTextNode(node.childNodes[i], cb);
-      } else if (node.nodeType === 3) {
-        cb(node);
-      }
-    }
-
-    function wrapInNode(textNode, start, end){
-      var text = textNode.nodeValue;
-      var before = document.createTextNode(text.slice(0, start));
-      var mid    = document.createElement("b");
-      mid.className = "auto-bold";
-      mid.textContent = text.slice(start, end);
-      var after  = document.createTextNode(text.slice(end));
-      var parent = textNode.parentNode;
-      parent.replaceChild(after, textNode);
-      parent.insertBefore(mid, after);
-      parent.insertBefore(before, mid);
-    }
 
     var applied = false;
     outer:
@@ -243,17 +280,42 @@ def _js_builder(headword, reading, cfg):
     return applied ? "applied:regex" : "no-match";
   }
 
-  var result = attemptBold();
-  if (result === "no-match"){
-    var obs = new MutationObserver(function(){
-      var r = attemptBold();
-      if (r !== "no-match"){ obs.disconnect(); }
-    });
-    obs.observe(root, {childList:true, subtree:true});
-    setTimeout(function(){ try{ obs.disconnect(); }catch(e){} }, OBS_MS);
+  function persistIfNeeded(){
+    if (!PERSIST) return;
+    if (!sentenceEl) return;
+
+    // Avoid duplicate save in the same review
+    if (sentenceEl.__autoBoldSaved) return;
+
+    var html = sentenceEl.innerHTML || "";
+    if (!html || html.indexOf("auto-bold") === -1) return;
+
+    // send innerHTML back to Python as base64
+    try {
+      var b64 = btoa(unescape(encodeURIComponent(html)));
+      pycmd("auto_bold_target__persist:" + b64);
+      sentenceEl.__autoBoldSaved = true;
+    } catch(e){}
   }
+
+  var result = attemptBold();
+  if (result !== "no-match"){
+    persistIfNeeded();
+    return;
+  }
+
+  // If no-match, observe for late changes (furigana, template scripts, etc.)
+  var obs = new MutationObserver(function(){
+    var r = attemptBold();
+    if (r !== "no-match"){
+      try { obs.disconnect(); } catch(e){}
+      persistIfNeeded();
+    }
+  });
+  obs.observe(root, {childList:true, subtree:true});
+  setTimeout(function(){ try{ obs.disconnect(); }catch(e){} }, OBS_MS);
 })();
-""" % (H, R, SELECTORS, STRICT, FALLBACK, CONVERT_T, REGEX_EN, BRIDGE, FIRST_ONE, OBS_MS)
+""" % (H, R, SELECTORS, STRICT, FALLBACK, CONVERT_T, REGEX_EN, BRIDGE, FIRST_ONE, OBS_MS, PERSIST)
 
 # -------- CSS injection (append last) --------------------------------------
 def _inject_css_once(cfg):
@@ -263,7 +325,6 @@ def _inject_css_once(cfg):
     js = r"""
     (function(){
       try{
-        // remove previous so we can re-append as last style (wins cascade)
         var old = document.getElementById('autoBoldCSS');
         if (old && old.parentNode) old.parentNode.removeChild(old);
         var el = document.createElement('style');
@@ -296,7 +357,6 @@ def _run(card, report=False):
         mw.progress.timer(delay + 200, _report_result, False)
 
 def _report_result():
-    # Keep the report simple; just check if any auto-bold was applied in common sentence containers
     check_js = """
       (function(){
         var sels = %s;
@@ -314,7 +374,7 @@ def _report_result():
     except Exception:
         pass
 
-# -------- JP font/locale helper (optional, keeps JP glyphs) ----------------
+# -------- JP font/locale helper --------------------------------------------
 def _force_lang_ja():
     try:
         mw.reviewer.web.eval(r"""
@@ -338,7 +398,6 @@ def _on_a(card):
     _force_lang_ja()
     _run(card)
 
-# ensure we don't double-register
 try: gui_hooks.reviewer_did_show_question.remove(_on_q)
 except Exception: pass
 try: gui_hooks.reviewer_did_show_answer.remove(_on_a)
@@ -354,19 +413,16 @@ def action_run_now():
         _run(c, report=True)
 
 def action_config():
-    # Try modern Anki API if available
     try:
         fn = getattr(mw.addonManager, "editConfig")
         return fn(__name__)
     except Exception:
         pass
-    # Older API name
     try:
         fn = getattr(mw.addonManager, "showConfigDialog")
         return fn(__name__)
     except Exception:
         pass
-    # Fallback JSON editor (Qt5/Qt6)
     current = mw.addonManager.getConfig(__name__) or {}
     try:
         initial = json.dumps(current if current else DEFAULTS, ensure_ascii=False, indent=2)
@@ -376,7 +432,7 @@ def action_config():
     layout = QVBoxLayout(dlg)
     edit = QTextEdit(dlg); edit.setPlainText(initial); layout.addWidget(edit)
     try:
-        Std = QDialogButtonBox.StandardButton  # PyQt6
+        Std = QDialogButtonBox.StandardButton
         buttons = QDialogButtonBox(Std.Save | Std.Cancel, parent=dlg)
     except AttributeError:
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dlg)
