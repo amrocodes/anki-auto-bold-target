@@ -1,4 +1,24 @@
-# Auto-bold target (JPMN/Migaku) — v2.2.0 (strict scope + persist to field)
+# Auto-bold target (JPMN/Migaku) — v2.2.1
+# Place in: Anki2/addons21/auto_bold_target/__init__.py
+#
+# Highlights the target word (incl. conjugations) on the *reviewed card only*,
+# then optionally persists the highlighted sentence HTML back to a field so it
+# syncs to mobile. Works with JPMN/Migaku templates, <t>…</t> tags, furigana.
+#
+# Key config (via Add-ons > auto_bold_target > Config):
+#   "note_types": ["JP Mining Note"]         # limit to these models
+#   "headword_fields": ["Word","Key"]         # first non-empty wins
+#   "reading_fields": ["WordReading"]         # optional reading (kana)
+#   "persist_to_field": true                  # write back to a field
+#   "persist_field_name": "sentence"          # which field to overwrite
+#   "persist_once": true                      # skip if already persisted
+#   "strict_scope": true                      # only inside sentence container
+#   "fallback_to_root": false                 # if no sentence match, skip
+#   "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }"
+#
+# Changelog:
+# 2.2.1: Fix webview hook signature to (handled, message, context);
+#        keep UI responsive; maintain persistence behavior.
 
 from aqt import mw, gui_hooks
 from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
@@ -34,9 +54,9 @@ DEFAULTS = {
     "observe_ms": 3000,
 
     # persistence
-    "persist_to_field": True,          # write back into a field so AnkiDroid sees it
-    "persist_field_name": "sentence",  # your field is named "sentence"
-    "persist_once": True,              # skip if field already contains <b class="auto-bold">
+    "persist_to_field": True,
+    "persist_field_name": "sentence",
+    "persist_once": True,
 
     # style
     "extra_css": ".full-sentence b.auto-bold { color:#ffe37a; font-weight:800; }",
@@ -68,45 +88,27 @@ def _should_run(card, cfg):
     except Exception:
         return True
 
-# -------- WebView bridge (persist callback) --------------------------------
-def _handle_cmd(msg, _context=None):
-    # Message format: auto_bold_target__persist:<base64 innerHTML>
-    if not isinstance(msg, str) or not msg.startswith("auto_bold_target__persist:"):
-        return False
+# -------- CSS injection (append last) --------------------------------------
+def _inject_css_once(cfg):
+    css = (cfg.get("extra_css") or "").strip()
+    if not css:
+        return
+    js = r"""
+    (function(){
+      try{
+        var old = document.getElementById('autoBoldCSS');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
+        var el = document.createElement('style');
+        el.id = 'autoBoldCSS';
+        el.textContent = %s;
+        (document.head || document.documentElement).appendChild(el);
+      }catch(e){}
+    })();
+    """ % json.dumps(css)
     try:
-        b64 = msg.split(":", 1)[1]
-        html = base64.b64decode(b64).decode("utf-8", "replace")
+        mw.reviewer.web.eval(js)
     except Exception:
-        return True
-
-    cfg = _cfg()
-    if not cfg.get("persist_to_field", True):
-        return True
-
-    card = getattr(mw.reviewer, "card", None)
-    if not card:
-        return True
-
-    field_name = cfg.get("persist_field_name", "sentence")
-    try:
-        note = card.note()
-        if field_name not in note:
-            tooltip(f"Auto-bold: field '{field_name}' not found", period=2000)
-            return True
-
-        # Optional: avoid repeated writes if already persisted
-        if cfg.get("persist_once", True) and "auto-bold" in note[field_name]:
-            return True
-
-        note[field_name] = html
-        note.flush()
-        # no need to checkpoint here; lightweight write during review
-        tooltip("Auto-bold: saved to note", period=1200)
-    except Exception as e:
-        tooltip(f"Auto-bold: save failed ({e})", period=3000)
-    return True
-
-gui_hooks.webview_did_receive_js_message.append(_handle_cmd)
+        pass
 
 # -------- Core JS builder ---------------------------------------------------
 def _js_builder(headword, reading, cfg):
@@ -140,8 +142,8 @@ def _js_builder(headword, reading, cfg):
   var PERSIST     = %s;
 
   // --- helpers ---
-  var KANA = "[\u3040-\u309F\u30A0-\u30FFー]";
-  var JAP  = "[\u3040-\u30FF\u4E00-\u9FFF々ー]";
+  var KANA = "[\u3040-\u309F\u30A0-\u30FF\u30FC]";
+  var JAP  = "[\u3040-\u30FF\u4E00-\u9FFF々\u30FC]";
   function esc(s){ return (s||"").replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); }
   function onlyKana(s){ return (s||"").replace(/[^ぁ-ゖァ-ヺー]/g,""); }
   function toHira(s){ return (s||"").replace(/[\u30A1-\u30FA]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60)); }
@@ -234,6 +236,7 @@ def _js_builder(headword, reading, cfg):
     var hasKanji = /[\u4E00-\u9FFF々]/.test(target || "");
     var patterns = [];
 
+    // A) flexible kanji bridge
     if (target && hasKanji){
       var ks = (target.match(/[\u4E00-\u9FFF々]/g) || []);
       if (ks.length){
@@ -241,6 +244,7 @@ def _js_builder(headword, reading, cfg):
         patterns.push(new RegExp(core, "g"));
       }
     }
+    // B) reading-based (kana) + trailing kana
     if (reading){
       var rd = onlyKana(reading);
       if (rd){
@@ -248,10 +252,12 @@ def _js_builder(headword, reading, cfg):
         patterns.push(new RegExp(esc(toKata(rd)) + KANA + "*", "g"));
       }
     }
+    // C) kana headword
     if (target && !hasKanji && /[\u3040-\u30FF]/.test(target)){
       patterns.push(new RegExp(esc(toHira(target)) + KANA + "*", "g"));
       patterns.push(new RegExp(esc(toKata(target)) + KANA + "*", "g"));
     }
+    // D/E) literal cores / literal target
     if (target){
       var kc = kanjiCore(target);
       if (kc) patterns.push(new RegExp(esc(kc), "g"));
@@ -283,14 +289,11 @@ def _js_builder(headword, reading, cfg):
   function persistIfNeeded(){
     if (!PERSIST) return;
     if (!sentenceEl) return;
-
-    // Avoid duplicate save in the same review
     if (sentenceEl.__autoBoldSaved) return;
 
     var html = sentenceEl.innerHTML || "";
     if (!html || html.indexOf("auto-bold") === -1) return;
 
-    // send innerHTML back to Python as base64
     try {
       var b64 = btoa(unescape(encodeURIComponent(html)));
       pycmd("auto_bold_target__persist:" + b64);
@@ -304,7 +307,6 @@ def _js_builder(headword, reading, cfg):
     return;
   }
 
-  // If no-match, observe for late changes (furigana, template scripts, etc.)
   var obs = new MutationObserver(function(){
     var r = attemptBold();
     if (r !== "no-match"){
@@ -316,28 +318,6 @@ def _js_builder(headword, reading, cfg):
   setTimeout(function(){ try{ obs.disconnect(); }catch(e){} }, OBS_MS);
 })();
 """ % (H, R, SELECTORS, STRICT, FALLBACK, CONVERT_T, REGEX_EN, BRIDGE, FIRST_ONE, OBS_MS, PERSIST)
-
-# -------- CSS injection (append last) --------------------------------------
-def _inject_css_once(cfg):
-    css = (cfg.get("extra_css") or "").strip()
-    if not css:
-        return
-    js = r"""
-    (function(){
-      try{
-        var old = document.getElementById('autoBoldCSS');
-        if (old && old.parentNode) old.parentNode.removeChild(old);
-        var el = document.createElement('style');
-        el.id = 'autoBoldCSS';
-        el.textContent = %s;
-        (document.head || document.documentElement).appendChild(el);
-      }catch(e){}
-    })();
-    """ % json.dumps(css)
-    try:
-        mw.reviewer.web.eval(js)
-    except Exception:
-        pass
 
 # -------- Runner & reporter -------------------------------------------------
 def _run(card, report=False):
@@ -405,6 +385,53 @@ except Exception: pass
 gui_hooks.reviewer_did_show_question.append(_on_q)
 gui_hooks.reviewer_did_show_answer.append(_on_a)
 
+# -------- WebView bridge (persist callback, 3-arg signature) ---------------
+def _handle_cmd(handled, message, context):
+    """(handled, message, context) -> (handled, result)"""
+    if handled:
+        return (handled, None)
+    if not isinstance(message, str) or not message.startswith("auto_bold_target__persist:"):
+        return (False, None)
+
+    # Decode payload
+    try:
+        b64 = message.split(":", 1)[1]
+        html = base64.b64decode(b64).decode("utf-8", "replace")
+    except Exception:
+        return (True, None)
+
+    cfg = _cfg()
+    if not cfg.get("persist_to_field", True):
+        return (True, None)
+
+    card = getattr(mw.reviewer, "card", None)
+    if not card:
+        return (True, None)
+
+    field_name = cfg.get("persist_field_name", "sentence")
+    try:
+        note = card.note()
+        if field_name not in note:
+            tooltip(f"Auto-bold: field '{field_name}' not found", period=2000)
+            return (True, None)
+
+        if cfg.get("persist_once", True) and "auto-bold" in note[field_name]:
+            return (True, None)
+
+        note[field_name] = html
+        note.flush()
+        tooltip("Auto-bold: saved to note", period=1200)
+    except Exception as e:
+        tooltip(f"Auto-bold: save failed ({e})", period=3000)
+
+    return (True, None)
+
+try:
+    gui_hooks.webview_did_receive_js_message.remove(_handle_cmd)
+except Exception:
+    pass
+gui_hooks.webview_did_receive_js_message.append(_handle_cmd)
+
 # -------- Tools menu actions -----------------------------------------------
 def action_run_now():
     c = getattr(mw.reviewer, "card", None)
@@ -413,16 +440,13 @@ def action_run_now():
         _run(c, report=True)
 
 def action_config():
+    # Try modern Anki API
     try:
         fn = getattr(mw.addonManager, "editConfig")
         return fn(__name__)
     except Exception:
         pass
-    try:
-        fn = getattr(mw.addonManager, "showConfigDialog")
-        return fn(__name__)
-    except Exception:
-        pass
+    # Fallback JSON editor (Qt5/Qt6)
     current = mw.addonManager.getConfig(__name__) or {}
     try:
         initial = json.dumps(current if current else DEFAULTS, ensure_ascii=False, indent=2)
@@ -432,7 +456,7 @@ def action_config():
     layout = QVBoxLayout(dlg)
     edit = QTextEdit(dlg); edit.setPlainText(initial); layout.addWidget(edit)
     try:
-        Std = QDialogButtonBox.StandardButton
+        Std = QDialogButtonBox.StandardButton  # PyQt6
         buttons = QDialogButtonBox(Std.Save | Std.Cancel, parent=dlg)
     except AttributeError:
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dlg)
