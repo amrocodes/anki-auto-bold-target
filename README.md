@@ -10,6 +10,7 @@ Works with JPMN and converted Anki cards. Handles kanji + kana conjugations, kan
 - Converts `<t>…</t>` markers to `<b>` automatically
 - Plays nice with JPMN/AJT/Migaku scripts
 - Tools menu action to force and report status
+- Solves Anki Chinese font for Japanese cards issue (ver 2.2.0)
 
 ## Requirements
 - Modern Anki Qt6 builds (e.g. 2.1.56+ and 2024–2025 releases)
