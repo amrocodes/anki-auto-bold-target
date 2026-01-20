@@ -6,6 +6,21 @@ from aqt.qt import QAction, QDialog, QVBoxLayout, QTextEdit, QDialogButtonBox
 from aqt.utils import tooltip
 import json, re
 
+def _save_note_undoably(note, label="Auto-bold"):
+    """Save note in a way that plays nice with Undo on modern & older Anki."""
+    try:
+        # Newer Anki: update_note creates a proper undo step
+        mw.checkpoint(label)
+        mw.col.update_note(note)
+    except Exception:
+        # Fallback: checkpoint + flush on older builds
+        try:
+            mw.checkpoint(label)
+        except Exception:
+            pass
+        note.flush()
+
+
 # ---------------- Config ----------------
 DEFAULTS = {
     # Which note types to act on (empty = all)
